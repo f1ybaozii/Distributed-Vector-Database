@@ -75,7 +75,7 @@ sympy==1.14.0
 systemd-python==234
 tiktoken==0.12.0
 tokenizers==0.22.1
-torch==2.1.0
+# torch==2.1.0
 tqdm==4.67.1
 transformers==4.57.3
 typing_extensions==4.15.0
