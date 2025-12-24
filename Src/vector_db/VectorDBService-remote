@@ -25,6 +25,7 @@ if len(sys.argv) <= 1 or sys.argv[1] == '--help':
     print('')
     print('Functions:')
     print('  BaseResponse add_record(WriteRequest request)')
+    print('  BaseResponse batch_add_records(BatchWriteRequest request)')
     print('  BaseResponse update_record(WriteRequest request)')
     print('  BaseResponse delete_record(DeleteRequest request)')
     print('  QueryResponse query(QueryRequest request)')
@@ -112,6 +113,12 @@ if cmd == 'add_record':
         print('add_record requires 1 args')
         sys.exit(1)
     pp.pprint(client.add_record(eval(args[0]),))
+
+elif cmd == 'batch_add_records':
+    if len(args) != 1:
+        print('batch_add_records requires 1 args')
+        sys.exit(1)
+    pp.pprint(client.batch_add_records(eval(args[0]),))
 
 elif cmd == 'update_record':
     if len(args) != 1:

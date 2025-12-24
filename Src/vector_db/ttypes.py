@@ -24,16 +24,22 @@ class VectorRecord(object):
      - attrs
      - file_type
      - file_path
+     - root_key
+     - chunk_id
+     - chunk_text
 
     """
 
 
-    def __init__(self, key=None, vector=None, attrs=None, file_type=None, file_path=None,):
+    def __init__(self, key=None, vector=None, attrs=None, file_type=None, file_path=None, root_key=None, chunk_id=None, chunk_text=None,):
         self.key = key
         self.vector = vector
         self.attrs = attrs
         self.file_type = file_type
         self.file_path = file_path
+        self.root_key = root_key
+        self.chunk_id = chunk_id
+        self.chunk_text = chunk_text
 
     def read(self, iprot):
         if iprot._fast_decode is not None and isinstance(iprot.trans, TTransport.CReadableTransport) and self.thrift_spec is not None:
@@ -80,6 +86,21 @@ class VectorRecord(object):
                     self.file_path = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
                 else:
                     iprot.skip(ftype)
+            elif fid == 6:
+                if ftype == TType.STRING:
+                    self.root_key = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
+                else:
+                    iprot.skip(ftype)
+            elif fid == 7:
+                if ftype == TType.STRING:
+                    self.chunk_id = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
+                else:
+                    iprot.skip(ftype)
+            elif fid == 8:
+                if ftype == TType.STRING:
+                    self.chunk_text = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
+                else:
+                    iprot.skip(ftype)
             else:
                 iprot.skip(ftype)
             iprot.readFieldEnd()
@@ -117,6 +138,18 @@ class VectorRecord(object):
             oprot.writeFieldBegin('file_path', TType.STRING, 5)
             oprot.writeString(self.file_path.encode('utf-8') if sys.version_info[0] == 2 else self.file_path)
             oprot.writeFieldEnd()
+        if self.root_key is not None:
+            oprot.writeFieldBegin('root_key', TType.STRING, 6)
+            oprot.writeString(self.root_key.encode('utf-8') if sys.version_info[0] == 2 else self.root_key)
+            oprot.writeFieldEnd()
+        if self.chunk_id is not None:
+            oprot.writeFieldBegin('chunk_id', TType.STRING, 7)
+            oprot.writeString(self.chunk_id.encode('utf-8') if sys.version_info[0] == 2 else self.chunk_id)
+            oprot.writeFieldEnd()
+        if self.chunk_text is not None:
+            oprot.writeFieldBegin('chunk_text', TType.STRING, 8)
+            oprot.writeString(self.chunk_text.encode('utf-8') if sys.version_info[0] == 2 else self.chunk_text)
+            oprot.writeFieldEnd()
         oprot.writeFieldStop()
         oprot.writeStructEnd()
 
@@ -125,6 +158,87 @@ class VectorRecord(object):
             raise TProtocolException(message='Required field key is unset!')
         if self.vector is None:
             raise TProtocolException(message='Required field vector is unset!')
+        return
+
+    def __repr__(self):
+        L = ['%s=%r' % (key, value)
+             for key, value in self.__dict__.items()]
+        return '%s(%s)' % (self.__class__.__name__, ', '.join(L))
+
+    def __eq__(self, other):
+        return isinstance(other, self.__class__) and self.__dict__ == other.__dict__
+
+    def __ne__(self, other):
+        return not (self == other)
+
+
+class BatchWriteRequest(object):
+    """
+    Attributes:
+     - records
+     - replica_num
+
+    """
+
+
+    def __init__(self, records=None, replica_num=3,):
+        self.records = records
+        self.replica_num = replica_num
+
+    def read(self, iprot):
+        if iprot._fast_decode is not None and isinstance(iprot.trans, TTransport.CReadableTransport) and self.thrift_spec is not None:
+            iprot._fast_decode(self, iprot, [self.__class__, self.thrift_spec])
+            return
+        iprot.readStructBegin()
+        while True:
+            (fname, ftype, fid) = iprot.readFieldBegin()
+            if ftype == TType.STOP:
+                break
+            if fid == 1:
+                if ftype == TType.LIST:
+                    self.records = []
+                    (_etype19, _size16) = iprot.readListBegin()
+                    for _i20 in range(_size16):
+                        _elem21 = VectorRecord()
+                        _elem21.read(iprot)
+                        self.records.append(_elem21)
+                    iprot.readListEnd()
+                else:
+                    iprot.skip(ftype)
+            elif fid == 2:
+                if ftype == TType.I32:
+                    self.replica_num = iprot.readI32()
+                else:
+                    iprot.skip(ftype)
+            else:
+                iprot.skip(ftype)
+            iprot.readFieldEnd()
+        iprot.readStructEnd()
+
+    def write(self, oprot):
+        if oprot._fast_encode is not None and self.thrift_spec is not None:
+            oprot.trans.write(oprot._fast_encode(self, [self.__class__, self.thrift_spec]))
+            return
+        oprot.writeStructBegin('BatchWriteRequest')
+        if self.records is not None:
+            oprot.writeFieldBegin('records', TType.LIST, 1)
+            oprot.writeListBegin(TType.STRUCT, len(self.records))
+            for iter22 in self.records:
+                iter22.write(oprot)
+            oprot.writeListEnd()
+            oprot.writeFieldEnd()
+        if self.replica_num is not None:
+            oprot.writeFieldBegin('replica_num', TType.I32, 2)
+            oprot.writeI32(self.replica_num)
+            oprot.writeFieldEnd()
+        oprot.writeFieldStop()
+        oprot.writeStructEnd()
+
+    def validate(self):
+        if self.records is None:
+            raise TProtocolException(message='Required field records is unset!')
+        if self.replica_num is None:
+            raise TProtocolException(message='Required field replica_num is unset!')
         return
 
     def __repr__(self):
@@ -277,14 +391,16 @@ class QueryRequest(object):
      - vector
      - filter
      - top_k
+     - aggregate
 
     """
 
 
-    def __init__(self, vector=None, filter=None, top_k=10,):
+    def __init__(self, vector=None, filter=None, top_k=10, aggregate=True,):
         self.vector = vector
         self.filter = filter
         self.top_k = top_k
+        self.aggregate = aggregate
 
     def read(self, iprot):
         if iprot._fast_decode is not None and isinstance(iprot.trans, TTransport.CReadableTransport) and self.thrift_spec is not None:
@@ -298,27 +414,32 @@ class QueryRequest(object):
             if fid == 1:
                 if ftype == TType.LIST:
                     self.vector = []
-                    (_etype19, _size16) = iprot.readListBegin()
-                    for _i20 in range(_size16):
-                        _elem21 = iprot.readDouble()
-                        self.vector.append(_elem21)
+                    (_etype26, _size23) = iprot.readListBegin()
+                    for _i27 in range(_size23):
+                        _elem28 = iprot.readDouble()
+                        self.vector.append(_elem28)
                     iprot.readListEnd()
                 else:
                     iprot.skip(ftype)
             elif fid == 2:
                 if ftype == TType.MAP:
                     self.filter = {}
-                    (_ktype23, _vtype24, _size22) = iprot.readMapBegin()
-                    for _i26 in range(_size22):
-                        _key27 = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
-                        _val28 = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
-                        self.filter[_key27] = _val28
+                    (_ktype30, _vtype31, _size29) = iprot.readMapBegin()
+                    for _i33 in range(_size29):
+                        _key34 = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
+                        _val35 = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
+                        self.filter[_key34] = _val35
                     iprot.readMapEnd()
                 else:
                     iprot.skip(ftype)
             elif fid == 3:
                 if ftype == TType.I32:
                     self.top_k = iprot.readI32()
+                else:
+                    iprot.skip(ftype)
+            elif fid == 4:
+                if ftype == TType.BOOL:
+                    self.aggregate = iprot.readBool()
                 else:
                     iprot.skip(ftype)
             else:
@@ -334,21 +455,25 @@ class QueryRequest(object):
         if self.vector is not None:
             oprot.writeFieldBegin('vector', TType.LIST, 1)
             oprot.writeListBegin(TType.DOUBLE, len(self.vector))
-            for iter29 in self.vector:
-                oprot.writeDouble(iter29)
+            for iter36 in self.vector:
+                oprot.writeDouble(iter36)
             oprot.writeListEnd()
             oprot.writeFieldEnd()
         if self.filter is not None:
             oprot.writeFieldBegin('filter', TType.MAP, 2)
             oprot.writeMapBegin(TType.STRING, TType.STRING, len(self.filter))
-            for kiter30, viter31 in self.filter.items():
-                oprot.writeString(kiter30.encode('utf-8') if sys.version_info[0] == 2 else kiter30)
-                oprot.writeString(viter31.encode('utf-8') if sys.version_info[0] == 2 else viter31)
+            for kiter37, viter38 in self.filter.items():
+                oprot.writeString(kiter37.encode('utf-8') if sys.version_info[0] == 2 else kiter37)
+                oprot.writeString(viter38.encode('utf-8') if sys.version_info[0] == 2 else viter38)
             oprot.writeMapEnd()
             oprot.writeFieldEnd()
         if self.top_k is not None:
             oprot.writeFieldBegin('top_k', TType.I32, 3)
             oprot.writeI32(self.top_k)
+            oprot.writeFieldEnd()
+        if self.aggregate is not None:
+            oprot.writeFieldBegin('aggregate', TType.BOOL, 4)
+            oprot.writeBool(self.aggregate)
             oprot.writeFieldEnd()
         oprot.writeFieldStop()
         oprot.writeStructEnd()
@@ -374,14 +499,16 @@ class QueryResponse(object):
      - records
      - code
      - msg
+     - aggregated_records
 
     """
 
 
-    def __init__(self, records=None, code=0, msg="success",):
+    def __init__(self, records=None, code=0, msg="success", aggregated_records=None,):
         self.records = records
         self.code = code
         self.msg = msg
+        self.aggregated_records = aggregated_records
 
     def read(self, iprot):
         if iprot._fast_decode is not None and isinstance(iprot.trans, TTransport.CReadableTransport) and self.thrift_spec is not None:
@@ -395,11 +522,11 @@ class QueryResponse(object):
             if fid == 1:
                 if ftype == TType.LIST:
                     self.records = []
-                    (_etype35, _size32) = iprot.readListBegin()
-                    for _i36 in range(_size32):
-                        _elem37 = VectorRecord()
-                        _elem37.read(iprot)
-                        self.records.append(_elem37)
+                    (_etype42, _size39) = iprot.readListBegin()
+                    for _i43 in range(_size39):
+                        _elem44 = VectorRecord()
+                        _elem44.read(iprot)
+                        self.records.append(_elem44)
                     iprot.readListEnd()
                 else:
                     iprot.skip(ftype)
@@ -411,6 +538,23 @@ class QueryResponse(object):
             elif fid == 3:
                 if ftype == TType.STRING:
                     self.msg = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
+                else:
+                    iprot.skip(ftype)
+            elif fid == 4:
+                if ftype == TType.MAP:
+                    self.aggregated_records = {}
+                    (_ktype46, _vtype47, _size45) = iprot.readMapBegin()
+                    for _i49 in range(_size45):
+                        _key50 = iprot.readString().decode('utf-8', errors='replace') if sys.version_info[0] == 2 else iprot.readString()
+                        _val51 = []
+                        (_etype55, _size52) = iprot.readListBegin()
+                        for _i56 in range(_size52):
+                            _elem57 = VectorRecord()
+                            _elem57.read(iprot)
+                            _val51.append(_elem57)
+                        iprot.readListEnd()
+                        self.aggregated_records[_key50] = _val51
+                    iprot.readMapEnd()
                 else:
                     iprot.skip(ftype)
             else:
@@ -426,8 +570,8 @@ class QueryResponse(object):
         if self.records is not None:
             oprot.writeFieldBegin('records', TType.LIST, 1)
             oprot.writeListBegin(TType.STRUCT, len(self.records))
-            for iter38 in self.records:
-                iter38.write(oprot)
+            for iter58 in self.records:
+                iter58.write(oprot)
             oprot.writeListEnd()
             oprot.writeFieldEnd()
         if self.code is not None:
@@ -437,6 +581,17 @@ class QueryResponse(object):
         if self.msg is not None:
             oprot.writeFieldBegin('msg', TType.STRING, 3)
             oprot.writeString(self.msg.encode('utf-8') if sys.version_info[0] == 2 else self.msg)
+            oprot.writeFieldEnd()
+        if self.aggregated_records is not None:
+            oprot.writeFieldBegin('aggregated_records', TType.MAP, 4)
+            oprot.writeMapBegin(TType.STRING, TType.LIST, len(self.aggregated_records))
+            for kiter59, viter60 in self.aggregated_records.items():
+                oprot.writeString(kiter59.encode('utf-8') if sys.version_info[0] == 2 else kiter59)
+                oprot.writeListBegin(TType.STRUCT, len(viter60))
+                for iter61 in viter60:
+                    iter61.write(oprot)
+                oprot.writeListEnd()
+            oprot.writeMapEnd()
             oprot.writeFieldEnd()
         oprot.writeFieldStop()
         oprot.writeStructEnd()
@@ -536,6 +691,15 @@ VectorRecord.thrift_spec = (
     (3, TType.MAP, 'attrs', (TType.STRING, 'UTF8', TType.STRING, 'UTF8', False), None, ),  # 3
     (4, TType.STRING, 'file_type', 'UTF8', None, ),  # 4
     (5, TType.STRING, 'file_path', 'UTF8', None, ),  # 5
+    (6, TType.STRING, 'root_key', 'UTF8', None, ),  # 6
+    (7, TType.STRING, 'chunk_id', 'UTF8', None, ),  # 7
+    (8, TType.STRING, 'chunk_text', 'UTF8', None, ),  # 8
+)
+all_structs.append(BatchWriteRequest)
+BatchWriteRequest.thrift_spec = (
+    None,  # 0
+    (1, TType.LIST, 'records', (TType.STRUCT, [VectorRecord, None], False), None, ),  # 1
+    (2, TType.I32, 'replica_num', None, 3, ),  # 2
 )
 all_structs.append(WriteRequest)
 WriteRequest.thrift_spec = (
@@ -554,6 +718,7 @@ QueryRequest.thrift_spec = (
     (1, TType.LIST, 'vector', (TType.DOUBLE, None, False), None, ),  # 1
     (2, TType.MAP, 'filter', (TType.STRING, 'UTF8', TType.STRING, 'UTF8', False), None, ),  # 2
     (3, TType.I32, 'top_k', None, 10, ),  # 3
+    (4, TType.BOOL, 'aggregate', None, True, ),  # 4
 )
 all_structs.append(QueryResponse)
 QueryResponse.thrift_spec = (
@@ -561,6 +726,7 @@ QueryResponse.thrift_spec = (
     (1, TType.LIST, 'records', (TType.STRUCT, [VectorRecord, None], False), None, ),  # 1
     (2, TType.I32, 'code', None, 0, ),  # 2
     (3, TType.STRING, 'msg', 'UTF8', "success", ),  # 3
+    (4, TType.MAP, 'aggregated_records', (TType.STRING, 'UTF8', TType.LIST, (TType.STRUCT, [VectorRecord, None], False), False), None, ),  # 4
 )
 all_structs.append(BaseResponse)
 BaseResponse.thrift_spec = (
