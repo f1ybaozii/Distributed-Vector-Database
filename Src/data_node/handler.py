@@ -1,6 +1,12 @@
 """数据节点Thrift处理器"""
 import faiss
+from vector_db.ttypes import (
+    VectorRecord,
+    QueryResponse,
+    BaseResponse
+)
 import vector_db.VectorDBService as VectorDBService
+import numpy as np
 
 class DataNodeHandler(VectorDBService.Iface):
     def __init__(self, data_node):
@@ -20,9 +26,11 @@ class DataNodeHandler(VectorDBService.Iface):
                 "chunk_text": record.chunk_text
             }
             self.data_node.wal.write("add", self.data_node.key_to_record[record.key])
-            self.data_node.index.add(faiss.array_to_vec(record.vector).reshape(1, -1))
+            # 核心修改：替换faiss.array_to_vec为np.array并指定float32
+            vec = np.array(record.vector, dtype=np.float32).reshape(1, -1)
+            self.data_node.index.add(vec)
             self.data_node._sync_to_replicas("add", request)
-        return vector_db.BaseResponse(code=0, msg="success")
+        return BaseResponse(code=0, msg="success")
 
     def batch_add_records(self, request):
         with self.data_node.lock:
@@ -38,11 +46,14 @@ class DataNodeHandler(VectorDBService.Iface):
                     "chunk_id": record.chunk_id,
                     "chunk_text": record.chunk_text
                 }
-            self.data_node.wal.write("batch_add", [self.data_node.key_to_record[r.key] for r in records])
-            vectors = [faiss.array_to_vec(r.vector).reshape(1, -1) for r in records]
-            self.data_node.index.add(faiss.concat_vecs(vectors))
+                self.data_node.wal.write("add", self.data_node.key_to_record[record.key])
+
+            # 核心修改1：向量转float32（FAISS必须）
+            vectors = [np.array(r.vector, dtype=np.float32).reshape(1, -1) for r in records]
+            vec_array = np.vstack(vectors)
+            self.data_node.index.add(vec_array)
             self.data_node._sync_to_replicas("batch_add", request)
-        return vector_db.BaseResponse(code=0, msg="batch add success")
+        return BaseResponse(code=0, msg="batch add success")
 
     def delete_record(self, request):
         with self.data_node.lock:
@@ -53,13 +64,14 @@ class DataNodeHandler(VectorDBService.Iface):
             self.data_node.wal.write("delete", {"key": key})
             self.data_node._rebuild_index()
             self.data_node._sync_to_replicas("delete", request)
-        return vector_db.BaseResponse(code=0, msg="delete success")
+        return BaseResponse(code=0, msg="delete success")
 
     def query(self, request):
         with self.data_node.lock:
             candidate_keys = set()
             if request.vector:
-                query_vec = faiss.array_to_vec(request.vector).reshape(1, -1)
+                # 核心修改：替换faiss.array_to_vec为np.array并指定float32（FAISS必须）
+                query_vec = np.array(request.vector, dtype=np.float32).reshape(1, -1)
                 distances, indices = self.data_node.index.search(query_vec, request.top_k * 5)
                 key_list = list(self.data_node.key_to_record.keys())
                 candidate_keys = set([key_list[i] for i in indices[0] if i < len(key_list)])
@@ -79,7 +91,7 @@ class DataNodeHandler(VectorDBService.Iface):
                     else:
                         match = record["attrs"][k] == v
                 if match:
-                    filtered_records.append(vector_db.VectorRecord(
+                    filtered_records.append(VectorRecord(
                         key=record["key"],
                         vector=record["vector"],
                         attrs=record["attrs"],
@@ -97,7 +109,7 @@ class DataNodeHandler(VectorDBService.Iface):
                     aggregated[root_key] = aggregated.get(root_key, []) + [r]
                 aggregated = dict(list(aggregated.items())[:request.top_k])
 
-            return vector_db.QueryResponse(
+            return QueryResponse(
                 records=filtered_records[:request.top_k],
                 code=0,
                 msg="success",

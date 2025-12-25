@@ -22,7 +22,7 @@ class VectorEncoder:
         os.makedirs(self.model_cache_dir, exist_ok=True)
 
         # 禁用网络，加载本地模型
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+       
         self.model = CLIPModel.from_pretrained(
             self.model_cache_dir,
             local_files_only=True,
@@ -39,6 +39,7 @@ class VectorEncoder:
 
         # Tokenizer初始化
         self.tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        
 
     def _split_text_to_chunks(self, text: str) -> list:
         if not text or text.strip() == "":
@@ -114,9 +115,16 @@ def create_encoder(model_cache_dir: str = None,
                    max_tokens: int = None,
                    chunk_overlap: int = None,
                    device: str = None) -> VectorEncoder:
-    return VectorEncoder(
-        model_cache_dir=model_cache_dir,
-        max_tokens=max_tokens or ENCODER_CONFIG["max_tokens"],
-        chunk_overlap=chunk_overlap or ENCODER_CONFIG["chunk_overlap"],
-        device=device or ENCODER_CONFIG["device"]
-    )
+    try:
+        encoder=VectorEncoder(
+            model_cache_dir=model_cache_dir,
+            max_tokens=max_tokens or ENCODER_CONFIG["max_tokens"],
+            chunk_overlap=chunk_overlap or ENCODER_CONFIG["chunk_overlap"],
+            device=device or ENCODER_CONFIG["device"]
+        )
+        print("Encoder初始化成功")
+    except Exception as e:
+        raise RuntimeError(f"Encoder初始化失败：{str(e)}")
+    
+    return encoder
+

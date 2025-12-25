@@ -10,6 +10,7 @@ sys.path.append(os.path.join(PROJECT_ROOT, "gen-py"))
 # 原有导入语句
 """分布式向量数据库统一入口"""
 from gateway.interactive_cli import start_interactive_cli
-
+from gateway.cli import main_cli
 if __name__ == "__main__":
-    start_interactive_cli()
+    # start_interactive_cli()
+    main_cli()

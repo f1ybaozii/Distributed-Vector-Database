@@ -2,8 +2,11 @@
 from flask import Flask
 from encoder import create_encoder
 from utils import get_zk_client
-from .routes import register_routes, encoder, zk
+from .routes import register_routes
 from config import GATEWAY_CONFIG
+
+encoder = None
+zk = None
 
 def init_gateway(zk_address: str = GATEWAY_CONFIG["zk_address"],
                  model_cache_dir: str = None):
@@ -25,4 +28,5 @@ def start_gateway(host: str = GATEWAY_CONFIG["host"],
                   port: int = GATEWAY_CONFIG["port"]):
     """启动网关"""
     app = create_gateway_app()
+    app.config['DEBUG'] = True
     app.run(host=host, port=port)
