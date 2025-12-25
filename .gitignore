@@ -1,3 +1,6 @@
 /Model
 /venv
 */__pycache__/
+/Data
+/Externel_tools
+launch.json
