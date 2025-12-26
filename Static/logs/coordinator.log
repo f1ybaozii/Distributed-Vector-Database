@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/flybaozii/VectorDB-849/DistributedVectorDB/src/coordinator/server.py", line 7, in <module>
+    from src.coordinator.handler import CoordinatorHandler
+  File "/home/flybaozii/VectorDB-849/DistributedVectorDB/src/coordinator/handler.py", line 10, in <module>
+    from src.utils import (
+  File "/home/flybaozii/VectorDB-849/DistributedVectorDB/src/utils/__init__.py", line 3, in <module>
+    from .shard_utils import get_shard_id, assign_shards_to_nodes
+ModuleNotFoundError: No module named 'src.utils.shard_utils'
