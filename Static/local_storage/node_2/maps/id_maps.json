@@ -1,0 +1,12 @@
+{
+  "vec_id_map": {
+    "test_1": 1
+  },
+  "meta_map": {
+    "test_1": {
+      "tag": "test",
+      "port": "8081"
+    }
+  },
+  "next_id": 2
+}

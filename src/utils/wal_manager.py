@@ -28,7 +28,25 @@ class WALManager:
         # 写入文件
         with open(log_file, "w", encoding="utf-8") as f:
             json.dump(log_data, f)
-
+    def replay_incremental(self, handler, checkpoint_ts):
+        """重放快照时间戳后的增量WAL日志"""
+        log_files = [f for f in os.listdir(self.wal_dir) 
+                     if f.endswith(".log") and int(f.split(".")[0]) > checkpoint_ts]
+        log_files = sorted(log_files)
+        
+        for log_file in log_files:
+            # 读取日志并执行对应操作（PUT/DELETE）
+            with open(os.path.join(self.wal_dir, log_file), "r") as f:
+                log_data = json.load(f)
+                op_type = log_data["op_type"]
+                key = log_data["key"]
+                if op_type == "PUT":
+                    vec = log_data["vector"]
+                    metadata = log_data.get("metadata")
+                    handler.put(VectorData(key=key, vector=vec, metadata=metadata), replay_mode=True)
+                elif op_type == "DELETE":
+                    handler.delete(key, replay_mode=True)
+        logger.info(f"[WAL] 重放增量日志完成，共处理{len(log_files)}个文件")
     # src/utils/wal_manager.py
     def replay(self, handler):
         
