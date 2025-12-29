@@ -1,262 +1,378 @@
 import sys
 import numpy as np
-import faiss
+import hnswlib
+import plyvel
+import json
+import time
+import os
+import threading
+import signal
+import shutil
 from loguru import logger
+
+# 原有业务导入（保持不变）
 from src.vector_db.VectorNodeService import Iface
 from src.vector_db.ttypes import VectorData, SearchRequest, SearchResult, Response
 from src.utils.zk_manager import get_zk_manager
 from src.utils.wal_manager import WALManager
-from Config import ZK_NODES_PATH,VECTOR_DIM
-import threading
-import os
-import json
-import time 
+from Config import ZK_NODES_PATH, VECTOR_DIM
+
 class VectorNodeHandler:
     def __init__(self, node_id):
         self.node_id = node_id
-        self.index_lock = threading.RLock()  # 并发锁
+        self.index_lock = threading.RLock()  # 全局并发锁
+        self.leveldb_lock = threading.Lock()  # LevelDB专属锁
         
-        # ========== 1. 新增：本地存储目录初始化（核心！）==========
+        # 1. 本地存储目录初始化
         self.local_storage_dir = f"./Static/local_storage/{self.node_id}"
-        self.index_dir = os.path.join(self.local_storage_dir, "faiss_index")
-        self.map_dir = os.path.join(self.local_storage_dir, "maps")
+        self.hnsw_index_dir = os.path.join(self.local_storage_dir, "hnsw_index")
+        self.leveldb_dir = os.path.join(self.local_storage_dir, "leveldb_data")
         self.wal_dir = os.path.join(self.local_storage_dir, "wal")
         self.checkpoint_dir = os.path.join(self.local_storage_dir, "checkpoint")
-        # 创建所有目录（不存在则新建）
-        for dir_path in [self.index_dir, self.map_dir, self.wal_dir, self.checkpoint_dir]:
+        self.deleted_ids_path = os.path.join(self.local_storage_dir, "deleted_ids.json")
+        
+        # 创建目录
+        for dir_path in [self.hnsw_index_dir, self.leveldb_dir, self.wal_dir, self.checkpoint_dir]:
             os.makedirs(dir_path, exist_ok=True)
         
-        # ========== 2. 初始化核心变量 ==========
-        self.zk_manager = get_zk_manager()  # 复用你的ZK管理器
-        self.wal_manager = WALManager(self.wal_dir)  # 复用你的WAL管理器
-        self.vec_id_map = {}  # key → Faiss逻辑ID（np.int64）
-        self.meta_map = {}    # key → 元数据（时间/标签等）
-        self.next_id = 0      # ID自增器
+        # 2. 核心组件初始化
+        self.zk_manager = get_zk_manager()
+        self.wal_manager = WALManager(self.wal_dir)
+        self.vector_dim = VECTOR_DIM
+        self.next_hnsw_id = 0  # HNSW自增ID
+        self.deleted_ids = set()  # 软删除ID集合（HNSW不支持物理删除）
         
-        # ========== 3. 启动时加载本地存储（核心！）==========
-        self.load_from_checkpoint()  # 优先加载快照，无则加载索引+映射表
+        # 3. HNSWlib 初始化（核心索引）
+        self.hnsw_index = hnswlib.Index(space='l2', dim=self.vector_dim)  # L2距离，可改为cosine
+        self._init_hnsw_index()
+        
+        # 4. LevelDB 初始化（存储key→(hnsw_id, vector, metadata)）
+        self.leveldb = plyvel.DB(self.leveldb_dir, create_if_missing=True, write_buffer_size=64*1024*1024)
+        
+        # 5. 加载软删除ID + 快照恢复
+        self._load_deleted_ids()
+        self.load_from_checkpoint()
+        
+        # 6. 注册退出钩子
+        import atexit
+        atexit.register(self._on_exit)
 
-    # ========== 4. Faiss索引持久化/加载（核心落盘逻辑）==========
-    def save_faiss_index(self):
-        """把Faiss索引持久化到本地磁盘"""
+    # ========== 退出时保存快照 + 清理资源 ==========
+    def _on_exit(self):
+        logger.info("执行退出逻辑：保存快照 + 关闭资源...")
         with self.index_lock:
-            index_path = os.path.join(self.index_dir, "vector_index.faiss")
-            faiss.write_index(self.index, index_path)
-            logger.info(f"[本地存储] Faiss索引落盘成功：{index_path}，索引总数：{self.index.index.ntotal}")
+            # 1. 保存HNSW索引
+            self.hnsw_index.save_index(os.path.join(self.hnsw_index_dir, "index.bin"))
+            # 2. 保存软删除ID
+            self._save_deleted_ids()
+            # 3. 保存快照
+            self.save_checkpoint()
+            # 4. 关闭LevelDB
+            self.leveldb.close()
+        logger.info("退出逻辑执行完成")
 
-    def load_faiss_index(self):
-        """从本地磁盘加载Faiss索引到内存"""
-        index_path = os.path.join(self.index_dir, "vector_index.faiss")
+    # ========== HNSWlib 核心操作 ==========
+    def _init_hnsw_index(self):
+        """初始化HNSW索引（加载已有索引或新建）"""
+        index_path = os.path.join(self.hnsw_index_dir, "index.bin")
         if os.path.exists(index_path):
-            # 内存映射模式：大索引不占满内存
-            self.index = faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
-            logger.info(f"[本地存储] 加载Faiss索引成功：{index_path}，索引总数：{self.index.index.ntotal}")
+            # 加载已有索引
+            self.hnsw_index.load_index(index_path)
+            # 恢复next_hnsw_id（索引中已有的元素数）
+            self.next_hnsw_id = self.hnsw_index.get_current_count()
+            logger.info(f"加载HNSW索引成功，当前元素数：{self.next_hnsw_id}")
         else:
-            # 无本地索引，初始化HNSW索引（比FlatL2快）
-            dim = 512  # 替换为你的向量维度！
-            base_index = faiss.IndexHNSWFlat(dim, 32)  # HNSW参数：32为邻居数
-            self.index = faiss.IndexIDMap(base_index)
-            logger.info(f"[本地存储] 无本地索引，初始化空HNSW索引（维度：{dim}）")
+            # 新建索引（参数：max_elements=初始容量，ef_construction=构建时的ef，M=邻居数）
+            self.hnsw_index.init_index(max_elements=1000000, ef_construction=128, M=32)
+            # 设置查询时的ef（越大越准，越慢）
+            self.hnsw_index.set_ef(64)
+            logger.info(f"初始化新HNSW索引，维度：{self.vector_dim}")
 
-    # ========== 5. 业务映射表持久化/加载（落盘key-ID映射）==========
-    def save_maps(self):
-        """持久化vec_id_map/meta_map/next_id到JSON文件"""
+    def _rebuild_hnsw_index(self):
+        """定期重建HNSW索引（清理已删除ID，释放空间）"""
+        logger.info("开始重建HNSW索引（清理已删除ID）...")
         with self.index_lock:
-            map_data = {
-                "vec_id_map": {k: int(v) for k, v in self.vec_id_map.items()},  # np.int64转int（JSON兼容）
-                "meta_map": self.meta_map,
-                "next_id": self.next_id
-            }
-            map_path = os.path.join(self.map_dir, "id_maps.json")
-            with open(map_path, "w", encoding="utf-8") as f:
-                json.dump(map_data, f, indent=2)
-            logger.info(f"[本地存储] 映射表落盘成功：{map_path}，key数：{len(self.vec_id_map)}")
+            # 1. 导出有效数据
+            valid_ids = []
+            valid_vectors = []
+            for hnsw_id in range(self.next_hnsw_id):
+                if hnsw_id not in self.deleted_ids:
+                    # 从LevelDB获取原始向量
+                    key = self._get_key_by_hnsw_id(hnsw_id)
+                    if key:
+                        vec_data = self.leveldb.get(key.encode('utf-8'))
+                        if vec_data:
+                            vec_dict = json.loads(vec_data)
+                            valid_vectors.append(np.array(vec_dict['vector'], dtype=np.float32))
+                            valid_ids.append(hnsw_id)
+            
+            # 2. 重建索引
+            self.hnsw_index = hnswlib.Index(space='l2', dim=self.vector_dim)
+            self.hnsw_index.init_index(max_elements=len(valid_vectors) + 10000, ef_construction=128, M=32)
+            self.hnsw_index.add_items(valid_vectors, valid_ids)
+            self.hnsw_index.set_ef(64)
+            # 3. 保存新索引
+            self.hnsw_index.save_index(os.path.join(self.hnsw_index_dir, "index.bin"))
+            # 4. 清空已删除ID
+            self.deleted_ids.clear()
+            self._save_deleted_ids()
+        
+        logger.info(f"HNSW索引重建完成，有效元素数：{len(valid_vectors)}")
 
-    def load_maps(self):
-        """从本地JSON加载映射表到内存"""
-        map_path = os.path.join(self.map_dir, "id_maps.json")
-        if os.path.exists(map_path):
-            with open(map_path, "r", encoding="utf-8") as f:
-                map_data = json.load(f)
-            # 恢复时转回np.int64（Faiss要求）
-            self.vec_id_map = {k: np.int64(v) for k, v in map_data["vec_id_map"].items()}
-            self.meta_map = map_data.get("meta_map", {})
-            self.next_id = map_data.get("next_id", 1)
-            logger.info(f"[本地存储] 加载映射表成功：{map_path}，key数：{len(self.vec_id_map)}")
-        else:
-            self.vec_id_map = {}
-            self.meta_map = {}
-            self.next_id = 1
-            logger.info("[本地存储] 无本地映射表，初始化空字典")
+    # ========== 软删除ID管理 ==========
+    def _save_deleted_ids(self):
+        """保存已删除ID到文件"""
+        with open(self.deleted_ids_path, 'w', encoding='utf-8') as f:
+            json.dump(list(self.deleted_ids), f)
 
-    # ========== 6. 快照功能（解决重启加载慢）==========
+    def _load_deleted_ids(self):
+        """加载已删除ID"""
+        if os.path.exists(self.deleted_ids_path):
+            with open(self.deleted_ids_path, 'r', encoding='utf-8') as f:
+                self.deleted_ids = set(json.load(f))
+            logger.info(f"加载已删除ID数：{len(self.deleted_ids)}")
+
+    # ========== LevelDB 辅助方法（key-HNSW ID映射）==========
+    def _get_hnsw_id_by_key(self, key: str) -> int:
+        """根据key查HNSW ID"""
+        with self.leveldb_lock:
+            vec_data = self.leveldb.get(key.encode('utf-8'))
+            if not vec_data:
+                return -1
+            vec_dict = json.loads(vec_data)
+            return vec_dict['hnsw_id']
+
+    def _get_key_by_hnsw_id(self, hnsw_id: int) -> str:
+        """根据HNSW ID查key（反向映射）"""
+        with self.leveldb_lock:
+            # 遍历LevelDB（小数据量可用，大数据量建议维护反向映射表）
+            for key, value in self.leveldb.iterator():
+                vec_dict = json.loads(value)
+                if vec_dict['hnsw_id'] == hnsw_id:
+                    return key.decode('utf-8')
+            return ""
+
+    # ========== 快照功能 ==========
     def save_checkpoint(self):
-        """保存全量快照：Faiss索引+映射表+WAL位置"""
+        """保存全量快照：HNSW索引 + LevelDB数据 + 软删除ID"""
         checkpoint_ts = int(time.time() * 1000)
         checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_{checkpoint_ts}")
         os.makedirs(checkpoint_path, exist_ok=True)
         
-        # 保存Faiss索引到快照
-        faiss.write_index(self.index, os.path.join(checkpoint_path, "vector_index.faiss"))
-        # 保存映射表到快照
-        map_data = {
-            "vec_id_map": {k: int(v) for k, v in self.vec_id_map.items()},
-            "meta_map": self.meta_map,
-            "next_id": self.next_id
-        }
-        with open(os.path.join(checkpoint_path, "id_maps.json"), "w") as f:
-            json.dump(map_data, f)
-        # 记录快照对应的WAL时间戳
+        # 1. 保存HNSW索引
+        hnsw_checkpoint_path = os.path.join(checkpoint_path, "index.bin")
+        self.hnsw_index.save_index(hnsw_checkpoint_path)
+        
+        # 2. 拷贝LevelDB数据
+        leveldb_checkpoint_path = os.path.join(checkpoint_path, "leveldb_data")
+        shutil.copytree(self.leveldb_dir, leveldb_checkpoint_path, dirs_exist_ok=True)
+        
+        # 3. 保存软删除ID
+        deleted_ids_checkpoint_path = os.path.join(checkpoint_path, "deleted_ids.json")
+        with open(deleted_ids_checkpoint_path, 'w', encoding='utf-8') as f:
+            json.dump(list(self.deleted_ids), f)
+        
+        # 4. 记录WAL位置
         with open(os.path.join(checkpoint_path, "wal_pos.txt"), "w") as f:
             f.write(str(checkpoint_ts))
         
-        logger.info(f"[本地存储] 快照保存成功：{checkpoint_path}")
+        logger.info(f"快照保存成功：{checkpoint_path}")
 
     def load_from_checkpoint(self):
-        """优先加载最新快照，再重放增量WAL"""
-        # 找最新快照
+        """从最新快照恢复"""
         checkpoint_dirs = [d for d in os.listdir(self.checkpoint_dir) if d.startswith("checkpoint_")]
-        if checkpoint_dirs:
-            latest_checkpoint = sorted(checkpoint_dirs)[-1]
-            checkpoint_path = os.path.join(self.checkpoint_dir, latest_checkpoint)
-            
-            # 加载快照中的Faiss索引
-            self.index = faiss.read_index(os.path.join(checkpoint_path, "vector_index.faiss"))
-            # 加载快照中的映射表
-            with open(os.path.join(checkpoint_path, "id_maps.json"), "r") as f:
-                map_data = json.load(f)
-            self.vec_id_map = {k: np.int64(v) for k, v in map_data["vec_id_map"].items()}
-            self.meta_map = map_data["meta_map"]
-            self.next_id = map_data["next_id"]
-            
-            # 重放快照后的增量WAL
-            with open(os.path.join(checkpoint_path, "wal_pos.txt"), "r") as f:
-                checkpoint_ts = int(f.read())
-            self.wal_manager.replay_incremental(self, checkpoint_ts)  # 需实现WAL增量重放
-            logger.info(f"[本地存储] 加载最新快照：{latest_checkpoint}，并重放增量WAL")
-        else:
-            # 无快照，直接加载索引+映射表
-            self.load_faiss_index()
-            self.load_maps()
+        if not checkpoint_dirs:
+            logger.info("无快照，使用当前数据")
+            return
+        
+        # 加载最新快照
+        latest_checkpoint = sorted(checkpoint_dirs)[-1]
+        checkpoint_path = os.path.join(self.checkpoint_dir, latest_checkpoint)
+        
+        # 1. 恢复HNSW索引
+        hnsw_checkpoint_path = os.path.join(checkpoint_path, "index.bin")
+        if os.path.exists(hnsw_checkpoint_path):
+            self.hnsw_index.load_index(hnsw_checkpoint_path)
+            self.next_hnsw_id = self.hnsw_index.get_current_count()
+            logger.info(f"恢复HNSW索引：{hnsw_checkpoint_path}")
+        
+        # 2. 恢复LevelDB数据
+        leveldb_checkpoint_path = os.path.join(checkpoint_path, "leveldb_data")
+        if os.path.exists(leveldb_checkpoint_path):
+            self.leveldb.close()
+            shutil.rmtree(self.leveldb_dir, ignore_errors=True)
+            shutil.copytree(leveldb_checkpoint_path, self.leveldb_dir)
+            self.leveldb = plyvel.DB(self.leveldb_dir, create_if_missing=True)
+            logger.info(f"恢复LevelDB数据：{leveldb_checkpoint_path}")
+        
+        # 3. 恢复软删除ID
+        deleted_ids_checkpoint_path = os.path.join(checkpoint_path, "deleted_ids.json")
+        if os.path.exists(deleted_ids_checkpoint_path):
+            with open(deleted_ids_checkpoint_path, 'r', encoding='utf-8') as f:
+                self.deleted_ids = set(json.load(f))
+            logger.info(f"恢复已删除ID数：{len(self.deleted_ids)}")
+        
+        # 4. 重放增量WAL
+        with open(os.path.join(checkpoint_path, "wal_pos.txt"), "r") as f:
+            checkpoint_ts = int(f.read())
+        self.wal_manager.replay_incremental(self, checkpoint_ts)
+        logger.info(f"加载最新快照：{latest_checkpoint}，并重放增量WAL")
 
-    # ========== 7. 改造put方法（添加自动落盘）==========
+    # ========== 核心业务接口 ==========
     def put(self, data: VectorData, replay_mode=False) -> Response:
         key = data.key
-        vec = np.array(data.vector, dtype=np.float32).reshape(1, -1)
+        vec = np.array(data.vector, dtype=np.float32)
+        metadata = data.metadata or {}
         
         with self.index_lock:
-            old_ntotal = self.index.index.ntotal
-            old_id = self.vec_id_map.get(key)
+            # 1. 处理旧key（覆盖）
+            old_hnsw_id = self._get_hnsw_id_by_key(key)
+            if old_hnsw_id != -1:
+                self.deleted_ids.add(old_hnsw_id)  # 标记旧ID删除
+                with self.leveldb_lock:
+                    self.leveldb.delete(key.encode('utf-8'))  # 删除LevelDB旧数据
+                logger.info(f"标记旧key={key}的HNSW ID={old_hnsw_id}为删除")
             
-            # 1. 删除旧key（重复key覆盖）
-            if old_id is not None:
-                del_id = np.int64(old_id)
-                del_count = self.index.remove_ids(np.array([del_id], dtype=np.int64))
-                if del_count == 0:
-                    logger.error(f"[PUT] 删除旧key={key}失败，ID={del_id}")
-                    return Response(success=False, message=f"删除旧key失败：{key}")
-                del self.vec_id_map[key]
-                if key in self.meta_map:
-                    del self.meta_map[key]
-                logger.info(f"[PUT] 成功删除旧key={key}，ID={del_id}")
+            # 2. 添加新向量到HNSW
+            new_hnsw_id = self.next_hnsw_id
+            self.hnsw_index.add_items(vec.reshape(1, -1), [new_hnsw_id])
+            self.next_hnsw_id += 1
             
-            # 2. 添加新key
-            new_id = np.int64(self.next_id)
-            self.index.add_with_ids(vec, np.array([new_id], dtype=np.int64))
-            self.vec_id_map[key] = new_id
-            if data.metadata:
-                self.meta_map[key] = data.metadata
-            self.next_id += 1
+            # 3. 写入LevelDB（key → {hnsw_id, vector, metadata}）
+            vec_dict = {
+                "hnsw_id": new_hnsw_id,
+                "vector": vec.tolist(),
+                "metadata": metadata
+            }
+            with self.leveldb_lock:
+                self.leveldb.put(key.encode('utf-8'), json.dumps(vec_dict).encode('utf-8'))
             
-            # 3. 自动落盘（非重放模式）
+            # 4. 自动落盘 + WAL
             if not replay_mode:
-                self.save_faiss_index()
-                self.save_maps()
-                self.wal_manager.write_log("PUT", key, data.vector, data.metadata)
-                # 定期保存快照（每100次操作，可自定义）
-                if self.next_id % 100 == 0:
+                # 保存HNSW索引
+                self.hnsw_index.save_index(os.path.join(self.hnsw_index_dir, "index.bin"))
+                # 保存软删除ID
+                self._save_deleted_ids()
+                # 写入WAL
+                self.wal_manager.write_log("PUT", key, data.vector, metadata)
+                # 定期重建索引（每1000次操作，清理删除数据）
+                if self.next_hnsw_id % 1000 == 0:
+                    self._rebuild_hnsw_index()
+                # 定期保存快照
+                if self.next_hnsw_id % 100 == 0:
                     self.save_checkpoint()
         
-        logger.info(f"[PUT] key={key}写入成功，新ID={new_id}，索引总数={self.index.index.ntotal}")
+        logger.info(f"PUT key={key}成功，HNSW ID={new_hnsw_id}")
         return Response(success=True, message=f"key={key}写入成功")
 
-    # ========== 8. 改造delete方法（添加自动落盘）==========
     def delete(self, key: str, replay_mode=False) -> Response:
-        if key not in self.vec_id_map:
-            logger.warning(f"[DELETE] key={key}不存在")
-            return Response(success=False, message=f"key={key}不存在")
-        
         with self.index_lock:
-            vec_id = self.vec_id_map[key]
-            del_count = self.index.remove_ids(np.array([vec_id], dtype=np.int64))
-            if del_count == 0:
-                logger.error(f"[DELETE] key={key}删除失败，ID={vec_id}")
-                return Response(success=False, message=f"删除失败：{key}")
+            # 1. 查HNSW ID
+            hnsw_id = self._get_hnsw_id_by_key(key)
+            if hnsw_id == -1:
+                logger.warning(f"DELETE key={key}不存在")
+                return Response(success=False, message=f"key={key}不存在")
             
-            # 删除映射表
-            del self.vec_id_map[key]
-            if key in self.meta_map:
-                del self.meta_map[key]
+            # 2. 标记删除 + 删除LevelDB数据
+            self.deleted_ids.add(hnsw_id)
+            with self.leveldb_lock:
+                self.leveldb.delete(key.encode('utf-8'))
             
-            # 自动落盘（非重放模式）
+            # 3. 自动落盘 + WAL
             if not replay_mode:
-                self.save_faiss_index()
-                self.save_maps()
+                self._save_deleted_ids()
                 self.wal_manager.write_log("DELETE", key)
         
-        logger.info(f"[DELETE] key={key}删除成功")
+        logger.info(f"DELETE key={key}成功，标记HNSW ID={hnsw_id}为删除")
         return Response(success=True, message=f"key={key}删除成功")
 
-    # ========== 9. 检索方法（复用你修复后的逻辑）==========
     def search(self, req: SearchRequest) -> Response:
+        """删除filter后的检索方法（简化版）"""
+        # 1. 基础参数处理
         query_vec = np.array(req.query_vector, dtype=np.float32).reshape(1, -1)
         top_k = req.top_k if req.top_k > 0 else 5
-        
-        distances, indices = self.index.search(query_vec, top_k)
-        valid_logic_ids = set(self.index.id_map) if hasattr(self.index, "id_map") else set()
-        
-        keys = []
-        vectors = []
-        valid_scores = []
-        for i in range(len(indices[0])):
-            vec_id = indices[0][i]
-            if vec_id == -1:
-                continue
-            vec_id_64 = np.int64(vec_id)
-            
-            # 校验ID有效性
-            if vec_id_64 not in valid_logic_ids or vec_id_64 not in self.vec_id_map.values():
-                logger.warning(f"[SEARCH] 无效ID：{vec_id}，跳过")
-                continue
-            
-            # 查找业务key
-            target_key = None
-            for k, v in self.vec_id_map.items():
-                if v == vec_id_64:
-                    target_key = k
-                    break
-            if not target_key:
-                continue
-            
-            # 重构向量
+        threshold = req.threshold
+        print("threshold=" + str(threshold))
+        query_k = min(top_k * 2, 50)  # 限制预查询k值，避免过大
+
+        with self.index_lock:
+            # 2. 关键：增大HNSW查询的ef参数（解决核心异常）
+            if hasattr(self.hnsw_index, 'set_ef'):
+                self.hnsw_index.set_ef(100)  # ef建议≥k*2，100是通用合理值
+
+            # 3. 执行KNN查询（仅捕获核心异常，不做多层重试）
             try:
-                vec = self.index.reconstruct(vec_id_64).tolist()
-            except Exception as e:
-                logger.error(f"[SEARCH] 重构ID={vec_id}失败：{e}")
-                continue
-            
-            keys.append(target_key)
-            vectors.append(VectorData(key=target_key, vector=vec))
-            valid_scores.append(float(distances[0][i]))
-        
+                indices,distances = self.hnsw_index.knn_query(query_vec, k=query_k)
+            except RuntimeError:
+                # 异常时降级为最小k值重试
+                indices,distances = self.hnsw_index.knn_query(query_vec, k=max(1, top_k))
+            print("indices=" + str(indices))
+            print("distances=" + str(distances))
+
+            # 4. 过滤已删除ID+阈值，构造结果
+            keys = []
+            vectors = []
+            valid_scores = []
+            valid_count = 0
+
+            # 兼容空结果场景
+            if len(indices) == 0 or len(indices[0]) == 0:
+                return Response(success=True, search_result=SearchResult(keys=[], scores=[], vectors=[]))
+
+            for i in range(len(indices[0])):
+                if valid_count >= top_k:
+                    break
+                hnsw_id = indices[0][i]
+                
+                # 跳过已删除ID
+                if hnsw_id in self.deleted_ids:
+                    continue
+                # 查key和向量数据
+                key = self._get_key_by_hnsw_id(hnsw_id)
+                logger.info("key=" + str(key))
+                vec_data = self.leveldb.get(key.encode('utf-8')) if key else None
+                if not key or not vec_data:
+                    continue
+                logger.info("vec_data=" + str(vec_data))
+                # 阈值过滤（L2距离越小越相似）
+                score = float(distances[0][i])
+                if score > threshold:
+                    continue
+    
+                # 构造结果
+                vec_dict = json.loads(vec_data)
+                keys.append(key)
+                vectors.append(VectorData(key=key, vector=vec_dict['vector'], metadata=vec_dict['metadata']))
+                valid_scores.append(score)
+                valid_count += 1
+
         result = SearchResult(keys=keys, scores=valid_scores, vectors=vectors)
         return Response(success=True, search_result=result)
 
-# 信号处理
-import signal
+    def get(self, key: str) -> Response:
+        with self.leveldb_lock:
+            vec_data = self.leveldb.get(key.encode('utf-8'))
+            if not vec_data:
+                return Response(success=False, message=f"key={key}不存在")
+            
+            # 解析向量和元数据
+            vec_dict = json.loads(vec_data)
+            # 检查是否被删除
+            if vec_dict['hnsw_id'] in self.deleted_ids:
+                return Response(success=False, message=f"key={key}已被删除")
+            
+            data = VectorData(
+                key=key,
+                vector=vec_dict['vector'],
+                metadata=vec_dict['metadata']
+            )
+            return Response(success=True, vector_data=data)
+
+# ========== 信号处理 ==========
 def _signal_handler(signum, frame):
-    logger.info("接收到退出信号，清理数据节点资源...")
+    logger.info(f"接收到退出信号 {signum}，触发退出逻辑...")
     sys.exit(0)
 
+# 注册信号
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
