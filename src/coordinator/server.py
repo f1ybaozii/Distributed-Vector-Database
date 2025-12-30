@@ -28,7 +28,7 @@ def start_coordinator(port: int = COORDINATOR_DEFAULT_PORT):
     )
 
     logger.info(f"协调节点启动成功，监听端口：{port}")
-    logger.info("按Ctrl+C优雅退出")
+    logger.info("按Ctrl+C退出")
     try:
         server.serve()
     except KeyboardInterrupt:

@@ -154,6 +154,7 @@ def get(ctx, key):
             click.echo(Fore.GREEN + f"✅ 获取成功！")
             click.echo(Fore.BLUE + f"📌 Key：{data.key}")
             click.echo(Fore.BLUE + f"📌 向量维度：{len(data.vector)}")
+            click.echo(Fore.BLUE + f"📌 向量值：{data.vector}")
             click.echo(Fore.BLUE + f"📌 元数据：{data.metadata}")
         else:
             click.echo(Fore.RED + f"❌ {resp.message}")

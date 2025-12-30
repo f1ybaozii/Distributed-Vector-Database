@@ -192,7 +192,7 @@ class VectorNodeHandler:
         # 1. 恢复HNSW索引
         hnsw_checkpoint_path = os.path.join(checkpoint_path, "index.bin")
         if os.path.exists(hnsw_checkpoint_path):
-            self.hnsw_index.load_index(hnsw_checkpoint_path)
+            self.hnsw_index.load_index(hnsw_checkpoint_path,max_elements=1000000)
             self.next_hnsw_id = self.hnsw_index.get_current_count()
             logger.info(f"恢复HNSW索引：{hnsw_checkpoint_path}")
         
@@ -223,47 +223,102 @@ class VectorNodeHandler:
         key = data.key
         vec = np.array(data.vector, dtype=np.float32)
         metadata = data.metadata or {}
-        
+
+        # ===== 基础合法性检查（防止维度污染索引）=====
+        if vec.ndim != 1 or vec.shape[0] != self.vector_dim:
+            return Response(
+                success=False,
+                message=f"vector dim mismatch: expect {self.vector_dim}, got {vec.shape}"
+            )
+
         with self.index_lock:
-            # 1. 处理旧key（覆盖）
+            # ===== 1. 索引健康检查（关键修复点）=====
+            try:
+                current_count = self.hnsw_index.get_current_count()
+                max_elements = self.hnsw_index.get_max_elements()
+            except Exception as e:
+                logger.error(f"HNSW index state invalid, rebuilding: {e}")
+                self._rebuild_hnsw_index()
+                current_count = self.hnsw_index.get_current_count()
+                max_elements = self.hnsw_index.get_max_elements()
+
+            # ===== 2. 防止 index 已满或被异常污染 =====
+            if current_count >= max_elements:
+                logger.error(
+                    f"HNSW index full or corrupted "
+                    f"(current={current_count}, max={max_elements}), rebuilding"
+                )
+                self._rebuild_hnsw_index()
+
+            # ===== 3. 处理 key 覆盖（软删除旧 ID）=====
             old_hnsw_id = self._get_hnsw_id_by_key(key)
             if old_hnsw_id != -1:
-                self.deleted_ids.add(old_hnsw_id)  # 标记旧ID删除
+                self.deleted_ids.add(old_hnsw_id)
                 with self.leveldb_lock:
-                    self.leveldb.delete(key.encode('utf-8'))  # 删除LevelDB旧数据
-                logger.info(f"标记旧key={key}的HNSW ID={old_hnsw_id}为删除")
-            
-            # 2. 添加新向量到HNSW
+                    self.leveldb.delete(key.encode("utf-8"))
+                logger.info(
+                    f"PUT overwrite: key={key}, old_hnsw_id={old_hnsw_id} marked deleted"
+                )
+
+            # ===== 4. 分配新 HNSW ID（连续、受控）=====
             new_hnsw_id = self.next_hnsw_id
-            self.hnsw_index.add_items(vec.reshape(1, -1), [new_hnsw_id])
+
+            # ===== 5. 写入 HNSW（单点失败即中断）=====
+            try:
+                self.hnsw_index.add_items(
+                    vec.reshape(1, -1),
+                    np.array([new_hnsw_id], dtype=np.int64)
+                )
+            except RuntimeError as e:
+                # 这是你现在遇到的核心异常兜底点
+                logger.error(f"HNSW add_items failed, rebuilding index: {e}")
+                self._rebuild_hnsw_index()
+
+                # rebuild 后重试一次（只允许一次）
+                new_hnsw_id = self.next_hnsw_id
+                self.hnsw_index.add_items(
+                    vec.reshape(1, -1),
+                    np.array([new_hnsw_id], dtype=np.int64)
+                )
+
+            # ===== 6. ID 递增（只在 add 成功后）=====
             self.next_hnsw_id += 1
-            
-            # 3. 写入LevelDB（key → {hnsw_id, vector, metadata}）
+
+            # ===== 7. 写入 LevelDB（原子性在锁内）=====
             vec_dict = {
                 "hnsw_id": new_hnsw_id,
                 "vector": vec.tolist(),
                 "metadata": metadata
             }
             with self.leveldb_lock:
-                self.leveldb.put(key.encode('utf-8'), json.dumps(vec_dict).encode('utf-8'))
-            
-            # 4. 自动落盘 + WAL
+                self.leveldb.put(
+                    key.encode("utf-8"),
+                    json.dumps(vec_dict).encode("utf-8")
+                )
+
+            # ===== 8. WAL + 持久化（非 replay）=====
             if not replay_mode:
-                # 保存HNSW索引
-                self.hnsw_index.save_index(os.path.join(self.hnsw_index_dir, "index.bin"))
-                # 保存软删除ID
-                self._save_deleted_ids()
-                # 写入WAL
-                self.wal_manager.write_log("PUT", key, data.vector, metadata)
-                # 定期重建索引（每1000次操作，清理删除数据）
-                if self.next_hnsw_id % 1000 == 0:
+                try:
+                    self.hnsw_index.save_index(
+                        os.path.join(self.hnsw_index_dir, "index.bin")
+                    )
+                    self._save_deleted_ids()
+                    self.wal_manager.write_log(
+                        "PUT", key, data.vector, metadata
+                    )
+                except Exception as e:
+                    logger.error(f"Persistence failed after PUT key={key}: {e}")
+
+                # ===== 9. 周期性维护 =====
+                if self.next_hnsw_id % 200000 == 0:
                     self._rebuild_hnsw_index()
-                # 定期保存快照
-                if self.next_hnsw_id % 100 == 0:
+
+                if self.next_hnsw_id % 2000 == 0:
                     self.save_checkpoint()
-        
-        logger.info(f"PUT key={key}成功，HNSW ID={new_hnsw_id}")
-        return Response(success=True, message=f"key={key}写入成功")
+
+        logger.info(f"PUT success: key={key}, hnsw_id={new_hnsw_id}")
+        return Response(success=True, message=f"key={key} 写入成功")
+
 
     def delete(self, key: str, replay_mode=False) -> Response:
         with self.index_lock:
@@ -287,67 +342,71 @@ class VectorNodeHandler:
         return Response(success=True, message=f"key={key}删除成功")
 
     def search(self, req: SearchRequest) -> Response:
-        """删除filter后的检索方法（简化版）"""
-        # 1. 基础参数处理
         query_vec = np.array(req.query_vector, dtype=np.float32).reshape(1, -1)
         top_k = req.top_k if req.top_k > 0 else 5
         threshold = req.threshold
-        print("threshold=" + str(threshold))
-        query_k = min(top_k * 2, 50)  # 限制预查询k值，避免过大
 
         with self.index_lock:
-            # 2. 关键：增大HNSW查询的ef参数（解决核心异常）
-            if hasattr(self.hnsw_index, 'set_ef'):
-                self.hnsw_index.set_ef(100)  # ef建议≥k*2，100是通用合理值
+            current_count = self.hnsw_index.get_current_count()
 
-            # 3. 执行KNN查询（仅捕获核心异常，不做多层重试）
-            try:
-                indices,distances = self.hnsw_index.knn_query(query_vec, k=query_k)
-            except RuntimeError:
-                # 异常时降级为最小k值重试
-                indices,distances = self.hnsw_index.knn_query(query_vec, k=max(1, top_k))
-            print("indices=" + str(indices))
-            print("distances=" + str(distances))
-
-            # 4. 过滤已删除ID+阈值，构造结果
-            keys = []
-            vectors = []
-            valid_scores = []
-            valid_count = 0
-
-            # 兼容空结果场景
-            if len(indices) == 0 or len(indices[0]) == 0:
+            # ====== 核心修复 1：元素不足，直接返回 ======
+            if current_count == 0:
                 return Response(success=True, search_result=SearchResult(keys=[], scores=[], vectors=[]))
 
-            for i in range(len(indices[0])):
-                if valid_count >= top_k:
-                    break
-                hnsw_id = indices[0][i]
-                
-                # 跳过已删除ID
-                if hnsw_id in self.deleted_ids:
-                    continue
-                # 查key和向量数据
-                key = self._get_key_by_hnsw_id(hnsw_id)
-                logger.info("key=" + str(key))
-                vec_data = self.leveldb.get(key.encode('utf-8')) if key else None
-                if not key or not vec_data:
-                    continue
-                logger.info("vec_data=" + str(vec_data))
-                # 阈值过滤（L2距离越小越相似）
-                score = float(distances[0][i])
-                if score > threshold:
-                    continue
-    
-                # 构造结果
-                vec_dict = json.loads(vec_data)
-                keys.append(key)
-                vectors.append(VectorData(key=key, vector=vec_dict['vector'], metadata=vec_dict['metadata']))
-                valid_scores.append(score)
-                valid_count += 1
+            # k 不能超过 current_count
+            k = min(top_k, current_count)
 
-        result = SearchResult(keys=keys, scores=valid_scores, vectors=vectors)
-        return Response(success=True, search_result=result)
+            # ====== 核心修复 2：ef 必须 >= k ======
+            ef = max(50, k * 2)
+            self.hnsw_index.set_ef(ef)
+
+            try:
+                indices, distances = self.hnsw_index.knn_query(query_vec, k=k*2)
+                logger.info("indices, distances:", indices, distances)
+            except RuntimeError as e:
+                # ====== 核心修复 3：一旦异常，索引视为不可用 ======
+                logger.error(f"HNSW knn_query failed: {e}")
+                return Response(success=False, message="HNSW index corrupted, search aborted")
+
+            keys = []
+            vectors = []
+            scores = []
+
+            for i in range(len(indices[0])):
+                hnsw_id = int(indices[0][i])
+
+                if hnsw_id in self.deleted_ids:
+                    logger.info("跳过已删除ID:", hnsw_id)
+                    continue
+
+                key = self._get_key_by_hnsw_id(hnsw_id)
+                if not key:
+                    logger.warning("HNSW ID无对应Key，跳过:", hnsw_id)
+                    continue
+
+                vec_data = self.leveldb.get(key.encode("utf-8"))
+                if not vec_data:
+                    logger.warning("LevelDB无对应数据，跳过Key:", key)
+                    continue
+
+                vec_dict = json.loads(vec_data)
+                score = float(distances[0][i])
+                # if score > threshold:
+                #     logger.info("跳过低于阈值的结果:", score)
+                #     continue
+
+                keys.append(key)
+                vectors.append(VectorData(key=key, vector=vec_dict["vector"], metadata=vec_dict["metadata"]))
+                scores.append(score)
+
+                if len(keys) >= top_k:
+                    break
+
+            return Response(
+                success=True,
+                search_result=SearchResult(keys=keys, scores=scores, vectors=vectors)
+            )
+
 
     def get(self, key: str) -> Response:
         with self.leveldb_lock:
