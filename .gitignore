@@ -5,5 +5,8 @@
 /Data
 /Externel_tools
 launch.json
-/Static
-
+/Static/local_storage
+/Static/logs
+/Static/wal
+coordinator.pid
+datanodes.pid

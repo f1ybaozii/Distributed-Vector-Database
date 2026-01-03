@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLIP 文本检索图片</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: "Microsoft YaHei", sans-serif;
+        }
+
+        body {
+            background-color: #f5f5f5;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        /* 搜索区域样式 */
+        .search-box {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .search-input {
+            flex: 1;
+            min-width: 300px;
+            height: 45px;
+            padding: 0 15px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 16px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        .search-input:focus {
+            border-color: #409eff;
+        }
+
+        .topk-select {
+            height: 45px;
+            padding: 0 15px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 16px;
+            outline: none;
+            cursor: pointer;
+        }
+
+        .search-btn {
+            height: 45px;
+            padding: 0 25px;
+            background-color: #409eff;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+
+        .search-btn:hover {
+            background-color: #337ecc;
+        }
+
+        .search-btn:disabled {
+            background-color: #90cafc;
+            cursor: not-allowed;
+        }
+
+        /* 加载状态 */
+        .loading {
+            display: none;
+            color: #409eff;
+            font-size: 16px;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .loading-icon {
+            width: 20px;
+            height: 20px;
+            border: 2px solid #409eff;
+            border-top: 2px solid transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* 结果展示区域 */
+        .result-area {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .result-title {
+            font-size: 18px;
+            margin-bottom: 15px;
+            color: #333;
+        }
+
+        .result-empty {
+            text-align: center;
+            padding: 50px 0;
+            color: #999;
+            font-size: 16px;
+        }
+
+        .image-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(224px, 1fr));
+            gap: 15px;
+        }
+
+        .image-item {
+            border-radius: 6px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+
+        .image-item:hover {
+            transform: translateY(-5px);
+        }
+
+        .image-item img {
+            width: 100%;
+            height: 224px;
+            object-fit: cover;
+            display: block;
+        }
+
+        .image-info {
+            padding: 8px 10px;
+            font-size: 12px;
+            color: #666;
+            background: #f9f9f9;
+        }
+
+        .image-path {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-bottom: 4px;
+        }
+
+        .image-score {
+            color: #e6a23c;
+            font-weight: 600;
+        }
+
+        /* 响应式适配 */
+        @media (max-width: 768px) {
+            .search-box {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .search-input {
+                min-width: unset;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 搜索区域 -->
+        <div class="search-box">
+            <input type="text" class="search-input" id="textInput" placeholder="请输入检索文本（如：a cat sitting on the sofa）">
+            <select class="topk-select" id="topkSelect">
+                <option value="1">Top 1</option>
+                <option value="3" selected>Top 3</option>
+                <option value="5">Top 5</option>
+                <option value="10">Top 10</option>
+                <option value="20">Top 20</option>
+            </select>
+            <button class="search-btn" id="searchBtn">搜索</button>
+            <div class="loading" id="loading">
+                <div class="loading-icon"></div>
+                <span>检索中...</span>
+            </div>
+        </div>
+
+        <!-- 结果展示区域 -->
+        <div class="result-area">
+            <h3 class="result-title" id="resultTitle">检索结果（0张）</h3>
+            <div class="result-empty" id="emptyTip" style="display: none;">暂无匹配的图片</div>
+            <div class="image-grid" id="imageGrid"></div>
+        </div>
+    </div>
+
+    <script>
+        // 核心配置：后端接口地址（需和你的后端服务匹配）
+        const API_BASE_URL = "http://127.0.0.1:8000"; // 替换为你的后端接口地址
+        const SEARCH_API = `${API_BASE_URL}/api/search`;
+
+        // DOM元素
+        const textInput = document.getElementById("textInput");
+        const topkSelect = document.getElementById("topkSelect");
+        const searchBtn = document.getElementById("searchBtn");
+        const loading = document.getElementById("loading");
+        const resultTitle = document.getElementById("resultTitle");
+        const emptyTip = document.getElementById("emptyTip");
+        const imageGrid = document.getElementById("imageGrid");
+
+        // 搜索按钮点击事件
+        searchBtn.addEventListener("click", async () => {
+            const text = textInput.value.trim();
+            const topk = parseInt(topkSelect.value);
+
+            // 输入校验
+            if (!text) {
+                alert("请输入检索文本！");
+                return;
+            }
+
+            // 状态切换：禁用按钮，显示加载
+            searchBtn.disabled = true;
+            loading.style.display = "flex";
+            imageGrid.innerHTML = "";
+            emptyTip.style.display = "none";
+
+            try {
+                // 调用后端检索接口
+                const response = await fetch(SEARCH_API, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        text: text,
+                        topk: topk
+                    })
+                });
+
+                const result = await response.json();
+
+                // 更新结果标题
+                resultTitle.textContent = `检索结果（${result.results.length}张）`;
+
+                // 处理结果
+                if (result.results.length === 0) {
+                    emptyTip.style.display = "block";
+                } else {
+                    // 渲染图片列表（带相似度分数）
+                    result.results.forEach(item => {
+                        const { file_path, score } = item;
+                        // 转换本地路径为前端可访问的URL（需后端配置静态文件服务）
+                        const imgUrl = `${API_BASE_URL}/static/${file_path.split('/Data/')[1]}`;
+                        
+                        const imageItem = document.createElement("div");
+                        imageItem.className = "image-item";
+                        // 渲染图片+路径+相似度分数（保留4位小数，转百分比展示）
+                        imageItem.innerHTML = `
+                            <img src="${imgUrl}" alt="检索结果图片" onerror="this.src='https://via.placeholder.com/224?text=图片加载失败'">
+                            <div class="image-info">
+                                <div class="image-path">${file_path}</div>
+                                <div class="image-score">相似度：${(score * 100).toFixed(2)}%</div>
+                            </div>
+                        `;
+                        imageGrid.appendChild(imageItem);
+                    });
+                }
+            } catch (error) {
+                console.error("检索失败：", error);
+                alert("检索失败，请检查后端服务是否正常！");
+                emptyTip.style.display = "block";
+                emptyTip.textContent = "检索失败，请重试";
+            } finally {
+                // 恢复状态
+                searchBtn.disabled = false;
+                loading.style.display = "none";
+            }
+        });
+
+        // 回车触发搜索
+        textInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                searchBtn.click();
+            }
+        });
+    </script>
+</body>
+</html>
